@@ -17,6 +17,7 @@ export default function VoiceInterface({
   setIsListening 
 }: VoiceInterfaceProps) {
   const [textInput, setTextInput] = useState("");
+  const [speechWarning, setSpeechWarning] = useState<string | null>(null);
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
@@ -31,16 +32,25 @@ export default function VoiceInterface({
         const transcript = event.results[0][0].transcript;
         onCommand(transcript);
         setIsListening(false);
+        setSpeechWarning(null);
       };
 
       recognitionRef.current.onerror = (event: any) => {
         console.error("Speech Error:", event.error);
         setIsListening(false);
+        if (event.error === "not-allowed") {
+          setSpeechWarning("MICROPHONE ACCESS IS BLOCKED BY THE PREVIEW IFRAME. PLEASE CLICK 'OPEN IN A NEW TAB' TO CONVERSE VERBALLY, OR CHAT VIA KEYBOARD DIRECTLY.");
+        } else {
+          setSpeechWarning(`SPEECH RECOGNITION EXCEPTION: ${event.error.toUpperCase()}. CONVERSE NATIVELY BY TYPING CONVENIENTLY BELOW.`);
+        }
       };
 
       recognitionRef.current.onend = () => {
         setIsListening(false);
       };
+    } else {
+      // No Speech Recognition in this browser/mode
+      setSpeechWarning("SPEECH SYNTHESIS SUPPORTED. PLEASE CONVERSE BY TYPING BELOW FOR LIVE VOICE REPLIES.");
     }
   }, [onCommand, setIsListening]);
 
@@ -109,6 +119,17 @@ export default function VoiceInterface({
             className="text-center text-[#00f2ff]/50 font-mono text-xs uppercase tracking-widest"
           >
             Voice recognition active
+          </motion.div>
+        )}
+        {speechWarning && (
+          <motion.div
+            initial={{ opacity: 0, y: 5 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 5 }}
+            className="p-3 bg-red-950/20 border border-red-900/30 rounded-xl text-[10px] text-red-400 font-mono text-center tracking-wide leading-relaxed uppercase relative"
+          >
+            <span className="text-red-500 font-bold mr-1">⚠️ [STABILITY_NOTICE]</span>
+            {speechWarning}
           </motion.div>
         )}
       </AnimatePresence>

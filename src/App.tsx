@@ -5,6 +5,7 @@ import VoiceInterface from "@/src/components/VoiceInterface";
 import ChatLog from "@/src/components/ChatLog";
 import { Cpu, ShieldAlert, Terminal, CloudSun, ChevronDown, ChevronUp, Share2, Copy, Download, Check, RefreshCw } from "lucide-react";
 import { cn } from "@/src/lib/utils";
+const neuralBackdrop = "/src/assets/images/neural_backdrop_1781591002790.jpg";
 
 export interface ModelOption {
   id: string;
@@ -31,8 +32,12 @@ function useClimateData() {
   const [climate, setClimate] = useState({
     temp: "--",
     condition: "SCANNING",
-    location: "UNKNOWN",
-    windSpeed: "--"
+    location: "SCANNING...",
+    windSpeed: "--",
+    windDirection: "--",
+    humidity: "--",
+    latitude: "",
+    longitude: "",
   });
 
   useEffect(() => {
@@ -40,12 +45,18 @@ function useClimateData() {
       try {
         const geoRes = await fetch("https://get.geojs.io/v1/ip/geo.json");
         const geoData = await geoRes.json();
-        
-        const weatherRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${geoData.latitude}&longitude=${geoData.longitude}&current_weather=true`);
-        const weatherData = await weatherRes.json();
+        const lat = geoData.latitude || "21.17";
+        const lon = geoData.longitude || "72.83";
+        const city = geoData.city || "LOCAL NODE";
 
-        // WMO condition mapping rough approx
-        const code = weatherData.current_weather.weathercode;
+        const weatherRes = await fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m`
+        );
+        const weatherData = await weatherRes.json();
+        const current = weatherData.current || {};
+
+        // WMO weather code to condition
+        const code = current.weather_code !== undefined ? current.weather_code : 0;
         let condText = "CLEAR";
         if (code >= 1 && code <= 3) condText = "CLOUDY";
         else if (code >= 45 && code <= 48) condText = "FOG";
@@ -53,14 +64,23 @@ function useClimateData() {
         else if (code >= 71 && code <= 77) condText = "SNOW";
         else if (code >= 95) condText = "STORM";
 
+        const windDirDegrees = current.wind_direction_10m || 0;
+        const windDirectionStrings = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+        const index = Math.floor((windDirDegrees / 22.5) + 0.5);
+        const windDirStr = windDirectionStrings[index % 16];
+
         setClimate({
-          temp: Math.round(weatherData.current_weather.temperature).toString(),
+          temp: current.temperature_2m !== undefined ? Math.round(current.temperature_2m).toString() : "--",
           condition: condText,
-          location: geoData.city || "LOCAL",
-          windSpeed: Math.round(weatherData.current_weather.windspeed).toString()
+          location: city.toUpperCase(),
+          windSpeed: current.wind_speed_10m !== undefined ? Math.round(current.wind_speed_10m).toString() : "--",
+          windDirection: windDirStr,
+          humidity: current.relative_humidity_2m !== undefined ? current.relative_humidity_2m.toString() : "75",
+          latitude: parseFloat(lat).toFixed(4),
+          longitude: parseFloat(lon).toFixed(4),
         });
       } catch (err) {
-        setClimate(c => ({ ...c, condition: "OFFLINE" }));
+        setClimate(c => ({ ...c, condition: "OFFLINE", location: "SURAT" }));
       }
     }
     fetchClimate();
@@ -108,12 +128,19 @@ function useSystemData() {
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
+  const messagesRef = useRef<Message[]>([]);
+  
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
   const [isProcessing, setIsProcessing] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [audioData, setAudioData] = useState<number[]>(new Array(10).fill(0));
   const [selectedModel, setSelectedModel] = useState<ModelOption>(MODELS[0]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   
   // Custom toast notification state
   const [toast, setToast] = useState<string | null>(null);
@@ -208,7 +235,28 @@ export default function App() {
         body: JSON.stringify({ 
           command: text, 
           engine: selectedModel.engine,
-          model: selectedModel.modelCode
+          model: selectedModel.modelCode,
+          history: messagesRef.current,
+          systemContext: {
+            cores: sysData.cores,
+            memory: sysData.memory,
+            platform: sysData.platform,
+            batteryLevel: sysData.batteryLevel,
+            batteryCharging: sysData.batteryCharging,
+            localIp: sysData.localIp,
+            localTime: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+          },
+          climateContext: {
+            location: climateData.location,
+            temp: climateData.temp,
+            condition: climateData.condition,
+            humidity: climateData.humidity,
+            latitude: climateData.latitude,
+            longitude: climateData.longitude,
+            windSpeed: climateData.windSpeed,
+            windDirection: climateData.windDirection
+          }
         })
       });
 
@@ -230,12 +278,61 @@ export default function App() {
         { id: Math.random().toString(), time: endStr, text: `AI_RESPONSE_SYNCHRONIZED: SUCCESS` }
       ]);
 
-      // Simple Text-to-Speech fallback
-      if ('speechSynthesis' in window && glitchMsg.content && !data.error) {
-        const utterance = new SpeechSynthesisUtterance(glitchMsg.content);
-        utterance.rate = 1.1;
-        utterance.pitch = 0.8; // Deep, robotic voice
-        window.speechSynthesis.speak(utterance);
+      // Interrupt/stop any currently playing text-to-speech
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+
+      // High-fidelity ElevenLabs voice synthesis handler
+      const playElevenLabsVoice = async (phrase: string) => {
+        try {
+          const ttsResponse = await fetch("/api/glitch/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: phrase })
+          });
+
+          const contentType = ttsResponse.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const ttsData = await ttsResponse.json();
+            if (ttsData.fallback) {
+              console.warn("ElevenLabs environment fallback: using local synthesize stream", ttsData.message);
+              playLocalSpeechFallback(phrase);
+            }
+          } else {
+            const blob = await ttsResponse.blob();
+            const audioUrl = URL.createObjectURL(blob);
+            const audio = new Audio(audioUrl);
+            activeAudioRef.current = audio;
+            await audio.play();
+
+            const playStr = new Date().toLocaleTimeString([], { hour12: false });
+            setNeuralLogs(prev => [
+              ...prev, 
+              { id: Math.random().toString(), time: playStr, text: "ELEVENLABS_AUDIO_STREAM: CONNECTED" }
+            ]);
+          }
+        } catch (err) {
+          console.warn("Failed to stream ElevenLabs high fidelity, playing default synthesis:", err);
+          playLocalSpeechFallback(phrase);
+        }
+      };
+
+      const playLocalSpeechFallback = (phrase: string) => {
+        if ('speechSynthesis' in window && phrase) {
+          const utterance = new SpeechSynthesisUtterance(phrase);
+          utterance.rate = 1.1;
+          utterance.pitch = 0.8; // Pitch of the system kernel
+          window.speechSynthesis.speak(utterance);
+        }
+      };
+
+      if (glitchMsg.content && !data.error) {
+        playElevenLabsVoice(glitchMsg.content);
       }
 
     } catch (error) {
@@ -324,7 +421,20 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-full bg-[#050505] text-[#e0e0e0] font-mono p-4 md:p-6 gap-6 overflow-hidden">
+    <div 
+      className="flex flex-col h-screen w-full bg-neutral-950 text-[#e0e0e0] font-mono p-4 md:p-6 gap-6 overflow-hidden relative"
+      style={{
+        backgroundImage: `url(${neuralBackdrop})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+      }}
+    >
+      <div 
+        className="absolute inset-0 bg-[#020202f2]/95 sm:bg-[#030302e3]/92 z-0 pointer-events-none" 
+        style={{
+          boxShadow: "inset 0 0 120px rgba(0,0,0,0.95)"
+        }}
+      />
       {/* Header */}
       <header className="flex justify-between items-end border-b border-[#333] pb-4 shrink-0 z-50 gap-4">
         <div className="flex flex-col">
@@ -398,31 +508,6 @@ export default function App() {
 
         {/* Action Toolbar on the right, matching with screenshot */}
         <div className="flex flex-col items-end gap-1 px-1">
-          {/* Action Toolbar */}
-          <div className="flex items-center gap-4 text-[#888] mb-1">
-            <button 
-              onClick={handleShareLogs}
-              title="Broadcast Telemetry Node Network"
-              className="p-1 hover:text-[#00f2ff] transition-all cursor-pointer hover:scale-110 active:scale-95"
-            >
-              <Share2 size={18} />
-            </button>
-            <button 
-              onClick={handleCopyLogs}
-              title="Copy Real-time Database buffer"
-              className="p-1 hover:text-emerald-500 transition-all cursor-pointer hover:scale-110 active:scale-95"
-            >
-              <Copy size={16} />
-            </button>
-            <button 
-              onClick={handleDownloadLogs}
-              title="Download Binary Log telemetry"
-              className="p-1 hover:text-[#00f2ff] transition-all cursor-pointer hover:scale-110 active:scale-95"
-            >
-              <Download size={18} />
-            </button>
-          </div>
-          
           {/* Privilege status badge */}
           <div className="flex items-center gap-2 text-[#22c55e] bg-emerald-950/20 border border-emerald-920/10 px-3 py-1 rounded-full select-none">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_#10b981]" />
@@ -434,7 +519,7 @@ export default function App() {
       {/* Main Bento Grid */}
       <main className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-12 md:grid-rows-6 gap-4 z-10 w-full relative overflow-y-auto md:overflow-hidden pb-4 md:pb-0">
         {/* Core Visualizer (Large Central Area) */}
-        <div className="col-span-1 md:col-span-8 row-span-4 bg-[#0a0a0a] border border-[#222] rounded-xl flex flex-col items-center justify-between pb-8 pt-4 px-4 relative overflow-hidden">
+        <div className="col-span-1 md:col-span-8 row-span-4 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl flex flex-col items-center justify-between pb-8 pt-4 px-4 relative overflow-hidden shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           {/* Header row elements shown in screenshot details */}
           <div className="absolute top-4 left-4 text-[10px] text-[#444] uppercase z-10 flex items-center gap-2 select-none font-mono">
             <span>Input: Natural Language Voice</span>
@@ -498,7 +583,7 @@ export default function App() {
         </div>
 
         {/* Neural Log Queue - Displays flowing system records exactly as pictured */}
-        <div className="col-span-1 md:col-span-4 row-span-4 bg-[#0a0a0a] border border-[#222] rounded-xl flex flex-col overflow-hidden">
+        <div className="col-span-1 md:col-span-4 row-span-4 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl flex flex-col overflow-hidden shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           <div className="px-5 pt-5 pb-3">
             <div className="text-[10px] text-[#666] uppercase tracking-widest border-b border-[#222] pb-2 flex justify-between select-none">
               <span>Neural Data Log</span>
@@ -524,7 +609,7 @@ export default function App() {
         </div>
 
         {/* System Stats Block 1 - Hardware Limit */}
-        <div className="col-span-1 md:col-span-2 row-span-2 bg-[#0a0a0a] border border-[#222] rounded-xl p-4 hidden sm:flex flex-col justify-between relative overflow-hidden">
+        <div className="col-span-1 md:col-span-2 row-span-2 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl p-4 hidden sm:flex flex-col justify-between relative overflow-hidden shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           <div className="text-[10px] text-[#666] uppercase border-b border-[#222] pb-1.5 select-none font-mono">Hardware Limit</div>
           <div className="flex justify-between items-center flex-1 py-1">
             <div className="flex flex-col gap-1 z-10">
@@ -556,11 +641,11 @@ export default function App() {
         </div>
 
         {/* System Stats Block 2 - Power / Response */}
-        <div className="col-span-1 md:col-span-3 row-span-2 bg-[#0a0a0a] border border-[#222] rounded-xl p-4 hidden sm:flex flex-col justify-between relative overflow-hidden">
+        <div className="col-span-1 md:col-span-3 row-span-2 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl p-4 hidden sm:flex flex-col justify-between relative overflow-hidden shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           <div className="text-[10px] text-[#666] uppercase border-b border-[#222] pb-1.5 select-none font-mono">Power / Response</div>
           <div className="flex justify-between items-center flex-1 py-1">
             <div className="flex flex-col gap-1 z-10">
-              <div className="text-xl md:text-2xl font-bold tracking-tight text-white font-mono">45%<span className="text-[10px] text-[#444] ml-1 uppercase font-mono">BATTERY</span></div>
+              <div className="text-xl md:text-2xl font-bold tracking-tight text-white font-mono">{sysData.batteryLevel}<span className="text-[10px] text-[#444] ml-1 uppercase font-mono">BATTERY</span></div>
               <div className="text-xl md:text-2xl font-bold tracking-tight text-white font-mono">{isProcessing ? "420" : "14"}<span className="text-[10px] text-zinc-500 ml-1 uppercase font-mono">ms LATENCY</span></div>
             </div>
             
@@ -573,7 +658,7 @@ export default function App() {
                 {/* Glowing fluid block representing fill capacity */}
                 <div 
                   className="w-full bg-[#10b981]/50 border-t border-[#10b981] shadow-[0_0_12px_rgba(16,185,129,0.5)] rounded-2xs relative overflow-hidden animate-pulse"
-                  style={{ height: "45%" }}
+                  style={{ height: sysData.batteryLevel }}
                 >
                   <div className="absolute top-0 w-full h-full bg-[linear-gradient(to_top,#10b981/15,transparent)]" />
                   <div className="absolute -top-1 left-1.5 w-1 h-1 bg-emerald-300 rounded-full animate-ping" />
@@ -608,7 +693,7 @@ export default function App() {
         </div>
 
         {/* Live Climate Detector - Atmos Array */}
-        <div className="col-span-1 md:col-span-3 row-span-2 bg-[#0a0a0a] border border-[#222] rounded-xl p-4 flex flex-col justify-between relative overflow-hidden group min-h-[140px]">
+        <div className="col-span-1 md:col-span-3 row-span-2 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl p-4 flex flex-col justify-between relative overflow-hidden group min-h-[140px] shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           <div className="text-[10px] text-[#666] uppercase border-b border-[#222] pb-1.5 flex justify-between items-center select-none font-mono">
             <span>Atmos Array</span>
             <span className="text-[#00f2ff] opacity-70 animate-pulse"><CloudSun size={12} /></span>
@@ -633,12 +718,12 @@ export default function App() {
           
           <div className="text-[9px] text-[#555] font-mono flex flex-col uppercase gap-0.5 select-none font-mono">
             <div className="flex justify-between">
-              <span>LOCATION: SURAT</span>
-              <span className="text-emerald-500/90 font-bold font-mono">RAIN (86% HUMIDITY)</span>
+              <span>LOCATION: {climateData.location}</span>
+              <span className="text-emerald-500/90 font-bold font-mono">{climateData.condition} ({climateData.humidity}% HUMIDITY)</span>
             </div>
             <div className="flex justify-between text-zinc-500 font-mono">
-              <span>GRID: 21°10'N 72°49'E</span>
-              <span>WIND: {climateData.windSpeed} km/h NNW</span>
+              <span>GRID: {climateData.latitude ? `${climateData.latitude}°N` : "21.17°N"} {climateData.longitude ? `${climateData.longitude}°E` : "72.83°E"}</span>
+              <span>WIND: {climateData.windSpeed} km/h {climateData.windDirection}</span>
             </div>
           </div>
           {/* Decorative radar sweep background */}
@@ -646,7 +731,7 @@ export default function App() {
         </div>
 
         {/* Recent Context Window - Dialog Logs Panel */}
-        <div className="col-span-1 md:col-span-4 row-span-2 bg-[#0a0a0a] border border-[#222] rounded-xl p-5 hidden md:flex flex-col overflow-hidden">
+        <div className="col-span-1 md:col-span-4 row-span-2 bg-[#08080bf0]/90 md:bg-[#07070af0]/80 border border-zinc-800/80 rounded-xl p-5 hidden md:flex flex-col overflow-hidden shadow-2xl backdrop-blur-md transition-all hover:border-zinc-700/60 z-10">
           <div className="text-[10px] text-[#666] uppercase mb-3 tracking-widest border-b border-[#222] pb-1.5 flex justify-between select-none font-mono">
             <span>Recent Context Window</span>
             <span className="text-[#00f2ff]/60 text-[9px] uppercase font-bold font-mono">Active Session</span>
